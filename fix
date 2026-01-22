@@ -1,0 +1,178 @@
+1. The "Guard" is applied too late (Race Condition)
+In your assignFromProximity method, you check the isSavingAssignment flag, but you don't set it to true immediately. You pass execution to assignTaskWithSelection, which sets the flag.
+
+In the microseconds it takes to call the second function, a rapid double-click can bypass the check in assignFromProximity before the flag turns true inside assignTaskWithSelection.
+
+Fix: Set the flag immediately in the public method.
+
+2. The Loop for Specific Tasks (Intended but confusing)
+If you have two specific tasks selected (e.g., Task A and Task B) and you click "Assign", your code explicitly loops through them and fires the API once per task.
+
+TypeScript
+// Inside assignTaskWithSelection
+for (const row of selectedRows) {
+  // This fires one API call per selected row
+  await firstValueFrom(this.http.post(...)); 
+}
+If you select 3 rows, you will see 3 API calls. This is not a bug in the code structure, but it looks like a "double submission" in the network tab.
+
+Solution: Refactored Code
+Here is the corrected logic to prevent the double-click race condition and optimize the *ngIf performance.
+
+Update 1: Fix assignFromProximity and unassignFromProximity (TS)
+Move the "Locking" logic (isSavingAssignment = true) to the entry point methods so the button is disabled instantly.
+
+TypeScript
+// ============================================================
+// REFACTORED ENTRY METHODS
+// ============================================================
+
+async assignFromProximity(fsr: ProximityFsr): Promise<void> {
+  // 1. Guard check
+  if (this.isSavingAssignment) {
+    return;
+  }
+  
+  // 2. Lock IMMEDIATELY to prevent double clicks
+  this.isSavingAssignment = true; 
+  this.showSpinner = true; // Optional: show spinner immediately for better UX
+
+  try {
+    // 3. Call the logic (remove the locking logic from inside this helper)
+    await this.assignTaskWithSelection(fsr, 'proximity');
+  } catch (error) {
+    console.error(error);
+  } finally {
+    // 4. Unlock ONLY here
+    this.isSavingAssignment = false;
+    this.showSpinner = false;
+  }
+}
+
+async unassignFromProximity(fsr: ProximityFsr): Promise<void> {
+  if (this.isSavingAssignment) {
+    return;
+  }
+
+  // Lock IMMEDIATELY
+  this.isSavingAssignment = true;
+  this.showSpinner = true;
+
+  try {
+    // ... Logic to calculate message ...
+    const selectedRows = this.taskSelection.selected;
+    // ... (Your existing validation logic) ...
+
+    // EXECUTE API CALLS
+    if (allSelected) {
+       // ... SaveAssignment call ...
+    } else {
+       // NOTE: This loop causes multiple API calls if multiple tasks are selected
+       for (const row of selectedRows) {
+          // ... SaveAssignment call ...
+       }
+    }
+
+    // RELOAD DATA
+    const savedSelections = this.saveTaskSelections();
+    this.hasChanges = true;
+    await this.loadTaskAssignmentData();
+    await this.loadProximityData();
+    await this.loadCurrentAssignment();
+    this.restoreTaskSelections(savedSelections);
+    
+    this.snackbar.openSnackBar('Unassignment completed successfully.', 'success');
+
+  } catch (error) {
+    console.error('Error during unassignment:', error);
+    this.snackbar.openSnackBar('Error while unassigning.', 'error');
+  } finally {
+    // Unlock
+    this.showSpinner = false;
+    this.isSavingAssignment = false; 
+  }
+}
+Update 2: Clean up assignTaskWithSelection (TS)
+Since we moved the locking/spinner/try-catch logic UP to the parent methods (assignFromProximity), you must remove it from here to avoid conflicts.
+
+TypeScript
+private async assignTaskWithSelection(
+  fsr: any,
+  source: 'proximity' | 'fsr'
+): Promise<void> {
+  // REMOVE: if (this.isSavingAssignment) return;  <-- Handled by parent
+  // REMOVE: this.isSavingAssignment = true;       <-- Handled by parent
+  // REMOVE: this.showSpinner = true;              <-- Handled by parent
+
+  const selectedRows = this.taskSelection.selected;
+  
+  // ... Validation logic ...
+
+  // NOTE: No Try/Catch/Finally here because the parent handles it
+  
+  if (allSelected) {
+    // ... API Call (Assign All)
+    await firstValueFrom(this.http.post(...));
+  } else {
+    // ... Loop API Calls (Assign Specific)
+    for (const row of selectedRows) {
+      await firstValueFrom(this.http.post(...));
+    }
+  }
+
+  this.hasChanges = true;
+
+  // Data Refresh Logic
+  await this.loadTaskAssignmentData();
+  await this.loadProximityData();
+  await this.loadCurrentAssignment();
+
+  // Restore selections
+  const savedSelections = this.saveTaskSelections();
+  this.restoreTaskSelections(savedSelections);
+  
+  this.filterForm.patchValue({ firstName: '', lastName: '' });
+  this.snackbar.openSnackBar('Assignment saved successfully.', 'success');
+}
+Update 3: Optimize Template (HTML)
+Using a function like isAlreadyAssignedProximity(fsr) inside an *ngIf in a table is dangerous. Angular runs this function every time it detects a change (mouse move, click, spinner show). This can cause the button to flicker or the click event to misfire if the result flips rapidly.
+
+Recommendation: Instead of calling the function in the HTML, rely on the assignmentStatus property you mapped in your TS file (you are already doing this mapping!).
+
+In loadProximityData and loadCurrentAssignment, you set assignmentStatus: 'assigned' | 'unassigned'. Use that field directly.
+
+In HTML:
+
+HTML
+<td mat-cell *matCellDef="let fsr">
+  
+  <ng-container *ngIf="!showSpinner; else loadingBtn">
+
+    <button
+      *ngIf="!isAlreadyAssignedProximity(fsr)"
+      mat-stroked-button
+      color="primary"
+      (click)="assignFromProximity(fsr); $event.stopPropagation()"
+      [disabled]="taskSelection.selected.length === 0 || isSavingAssignment" 
+      class="action-button no-border"
+    >
+      Assign {{ isAllTaskSelected() ? 'All' : '' }}
+    </button>
+
+    <button
+      *ngIf="isAlreadyAssignedProximity(fsr)"
+      mat-stroked-button
+      color="warn"
+      (click)="unassignFromProximity(fsr); $event.stopPropagation()"
+      [disabled]="taskSelection.selected.length === 0 || isSavingAssignment"
+      class="action-button no-border"
+    >
+      Unassign {{ isAllTaskSelected() ? 'All' : '' }}
+    </button>
+
+  </ng-container>
+
+  <ng-template #loadingBtn>
+    <button mat-button disabled>Updating...</button>
+  </ng-template>
+</td>
